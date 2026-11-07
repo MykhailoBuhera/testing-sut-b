@@ -1,0 +1,203 @@
+# ЛР9 — CI pipeline для SUT B «Реєстрація на навчальні курси», варіант 03
+# build → unit tests → (integration/regression ∥ API tests)
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write # публікація JUnit-звітів як check runs
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+defaults:
+  run:
+    working-directory: sut-b
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Install built wheel and import app
+        run: |
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c "import courses.api as api; print('routes:', len(api.app.routes))"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: sut-b/dist/
+          retention-days: 7
+
+  unit-tests:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            sut-b/pyproject.toml
+            sut-b/requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[test]" -r requirements-ci.txt
+
+      - name: Run unit tests
+        run: >
+          python -m pytest tests/unit -v
+          --junitxml=reports/unit-junit.xml
+          --html=reports/unit-report.html --self-contained-html
+
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: sut-b/reports/
+          retention-days: 14
+
+      - name: Publish unit test results
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: sut-b/reports/unit-junit.xml
+          check_name: Unit tests report
+          detailed_summary: true
+
+  integration-tests:
+    name: Integration tests (regression, Testcontainers)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            sut-b/pyproject.toml
+            sut-b/requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[regression]" -r requirements-ci.txt
+
+      - name: Run regression suite (PostgreSQL via Testcontainers)
+        run: >
+          python -m pytest tests/enrollment_regression.py -m regression -v -p randomly
+          --junitxml=reports/integration-junit.xml
+          --html=reports/integration-report.html --self-contained-html
+
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report
+          path: sut-b/reports/
+          retention-days: 14
+
+      - name: Publish integration test results
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: sut-b/reports/integration-junit.xml
+          check_name: Integration tests report
+          detailed_summary: true
+
+  api-tests:
+    name: API tests (FastAPI + PostgreSQL)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: courses_student
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: courses_variant03_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U courses_student -d courses_variant03_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: courses_variant03_test
+      DB_USER: courses_student
+      DB_PASSWORD: ci_password
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            sut-b/pyproject.toml
+            sut-b/requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[test]" -r requirements-ci.txt
+
+      - name: Apply migration
+        env:
+          PGPASSWORD: ci_password
+        run: psql -h localhost -U courses_student -d courses_variant03_test -v ON_ERROR_STOP=1 -f migrations/V1__create_tables.sql
+
+      - name: Run API tests
+        run: >
+          python -m pytest tests/api tests/test_environment.py -v
+          --junitxml=reports/api-junit.xml
+          --html=reports/api-report.html --self-contained-html
+
+      - name: Upload API test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-report
+          path: sut-b/reports/
+          retention-days: 14
+
+      - name: Publish API test results
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: sut-b/reports/api-junit.xml
+          check_name: API tests report
+          detailed_summary: true
